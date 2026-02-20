@@ -172,9 +172,6 @@ def configure() {
     if (logEnable) log.debug "${device.displayName}: configure()"
     def cmds = []
 
-    // Bind the Door Lock cluster so unsolicited attribute reports reach the hub
-    cmds += zigbee.addBinding(0x0101)
-
     // ── Battery — firmware 1092-000C-40A34412 uses 0x0020 ONLY ───────────
     // attr 0x0020 — BatteryVoltage (UINT8, units = 100 mV)
     //   Report no more than once per 30 s, at least once per hour,
