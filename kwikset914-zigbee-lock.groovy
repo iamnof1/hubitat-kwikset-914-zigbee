@@ -145,8 +145,9 @@ metadata {
 
 def installed() {
     log.info "${device.displayName}: driver installed"
-    state.lockCodes    = [:]
-    state.pendingCodes = [:]
+    state.lockCodes      = [:]
+    state.pendingCodes   = [:]
+    state.pendingDeletes = [:]
     sendEvent(name: "lock",        value: "unknown")
     sendEvent(name: "lockJammed",  value: "clear")
     sendEvent(name: "tamperAlert", value: "clear")
@@ -243,6 +244,8 @@ def setCode(codeNumber, code, name = null) {
 
 def deleteCode(codeNumber) {
     if (logEnable) log.debug "${device.displayName}: deleteCode(${codeNumber})"
+    if (!state.pendingDeletes) state.pendingDeletes = [:]
+    state.pendingDeletes["${codeNumber as int}"] = true
     return zigbee.command(0x0101, 0x07, buildUserIdPayload(codeNumber as int))
 }
 
@@ -320,6 +323,11 @@ private List parseBatteryVoltage(String hexValue) {
     def thresh = batteryThresholds()
     def minV   = thresh.min as double
     def maxV   = thresh.max as double
+
+    if (minV >= maxV) {
+        log.warn "${device.displayName}: battery voltage thresholds invalid (min ${minV} V >= max ${maxV} V) — check preferences"
+        return []
+    }
 
     def pct   = ((volts - minV) / (maxV - minV) * 100).round() as int
     pct       = Math.max(0, Math.min(100, pct))
@@ -457,8 +465,13 @@ private List parseOperatingEvent(Map d) {
     if (txtEnable) log.info descText
     if (codeName) sendEvent(name: "lastCodeName", value: codeName)
 
+    // Include usedCode so Lock Code Manager can attribute the event to a named user.
+    // Only set when userID > 0; a zero ID means physical/manual operation (no code).
+    def evtData = userID > 0 ? [usedCode: userID, codeName: codeName ?: ""] : [:]
+
     return [
-        createEvent(name: "lock",       value: lockVal, descriptionText: descText),
+        createEvent(name: "lock",       value: lockVal, descriptionText: descText,
+                    data: evtData),
         createEvent(name: "lockJammed", value: "clear")
     ]
 }
@@ -550,14 +563,35 @@ private List handleSetPinResponse(Map d) {
 /**
  * Clear PIN Code Response — server cmd 0x07.
  * Payload: Status (uint8).  Like setPin, the response doesn't echo the user ID.
- * The Programming Event Notification that follows will update state.lockCodes.
+ *
+ * We update state and fire codeChanged immediately here rather than waiting for
+ * a Programming Event Notification, because some firmware versions do not send
+ * Programming Events for hub-initiated deletes.  If a Programming Event does
+ * arrive afterward, the remove() is a no-op and the duplicate codeChanged event
+ * is harmless to Lock Code Manager.
  */
 private List handleClearPinResponse(Map d) {
     if (!d.data) return []
     def status = Integer.parseInt(d.data[0], 16)
-    if (status != 0x00) log.warn "${device.displayName}: delete code failed, status=${status}"
-    else if (logEnable) log.debug "${device.displayName}: delete code response: success"
-    return []
+    if (status != 0x00) {
+        log.warn "${device.displayName}: delete code failed, status=${status}"
+        return []
+    }
+    if (logEnable) log.debug "${device.displayName}: delete code response: success"
+
+    def pending = state.pendingDeletes ?: [:]
+    def slot = pending.keySet().min { it.toInteger() }
+    if (!slot) return []
+    pending.remove(slot)
+    state.pendingDeletes = pending
+
+    def codes = state.lockCodes ?: [:]
+    codes.remove(slot)
+    state.lockCodes = codes
+    updateLockCodesAttribute(codes)
+    if (txtEnable) log.info "${device.displayName}: code slot ${slot} deleted"
+    return [createEvent(name: "codeChanged", value: "${slot} deleted",
+                        descriptionText: "${device.displayName} code slot ${slot} deleted")]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
