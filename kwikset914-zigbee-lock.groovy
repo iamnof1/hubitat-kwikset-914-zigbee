@@ -285,6 +285,11 @@ def parse(String description) {
         log.warn "${device.displayName}: could not parse: ${description}"
         return null
     }
+    // parseDescriptionAsMap populates .cluster for read-attr frames but may
+    // only populate .clusterId for catchall frames — normalise to one field.
+    if (!descMap.cluster && descMap.clusterId) {
+        descMap.cluster = descMap.clusterId
+    }
     if (logEnable) log.debug "${device.displayName}: descMap → ${descMap}"
 
     def result = []
@@ -552,8 +557,20 @@ private List handleSetPinResponse(Map d) {
         if (txtEnable) log.info "${device.displayName}: code slot ${slot} (${info.name}) set successfully"
         return [createEvent(name: "codeChanged", value: "${slot} set",
                             descriptionText: "${device.displayName} code slot ${slot} set")]
+    } else if (status == 0x03) {
+        // Duplicate code — the slot already contains a PIN (e.g. left over from a
+        // previous pairing or the generic driver).  Clear the slot first, then
+        // re-queue the pending entry so the next setCode call will succeed.
+        log.warn "${device.displayName}: code slot ${slot} duplicate — clearing slot and re-queuing"
+        if (!state.pendingCodes) state.pendingCodes = [:]
+        state.pendingCodes[slot] = info   // put it back so the retry finds it
+        // Schedule the clear+re-set after a short delay to allow the clear response to arrive.
+        state.retrySlot = slot
+        state.retryInfo = info
+        runIn(2, retrySetCodeAfterClear)
+        return [zigbee.command(0x0101, 0x07, buildUserIdPayload(slot as int))]
     } else {
-        def reason = status == 0x02 ? "memory full" : status == 0x03 ? "duplicate code" : "general failure"
+        def reason = status == 0x02 ? "memory full" : "general failure (status=0x${String.format('%02X', status)})"
         log.warn "${device.displayName}: set code slot ${slot} failed — ${reason}"
         return [createEvent(name: "codeChanged", value: "${slot} failed",
                             descriptionText: "${device.displayName} code slot ${slot} set failed (${reason})")]
@@ -579,6 +596,24 @@ private List handleClearPinResponse(Map d) {
     }
     if (logEnable) log.debug "${device.displayName}: delete code response: success"
 
+    // Check if this clear was triggered by a duplicate-retry (retrySlot is set)
+    // rather than a user-initiated deleteCode.  If so, now re-send the setCode.
+    if (state.retrySlot) {
+        def slot = state.retrySlot
+        def info = state.retryInfo
+        state.remove("retrySlot")
+        state.remove("retryInfo")
+        // Remove from pendingCodes — Lock Code Manager will re-issue setCode on its next cycle.
+        def pending2 = state.pendingCodes ?: [:]
+        pending2.remove(slot)
+        state.pendingCodes = pending2
+        if (txtEnable) log.info "${device.displayName}: slot ${slot} cleared of pre-existing PIN — Lock Code Manager will re-issue setCode automatically"
+        // Cancel the scheduled fallback (it's no longer needed)
+        unschedule("retrySetCodeAfterClear")
+        return [createEvent(name: "codeChanged", value: "${slot} failed",
+                            descriptionText: "${device.displayName} slot ${slot} cleared of duplicate — Lock Code Manager will retry")]
+    }
+
     def pending = state.pendingDeletes ?: [:]
     def slot = pending.keySet().min { it.toInteger() }
     if (!slot) return []
@@ -592,6 +627,29 @@ private List handleClearPinResponse(Map d) {
     if (txtEnable) log.info "${device.displayName}: code slot ${slot} deleted"
     return [createEvent(name: "codeChanged", value: "${slot} deleted",
                         descriptionText: "${device.displayName} code slot ${slot} deleted")]
+}
+
+/**
+ * Scheduled callback: re-send a setCode after clearing a duplicate slot.
+ * Called 2 s after a 0x03-Duplicate response so the clear has time to land.
+ */
+def retrySetCodeAfterClear() {
+    def slot = state.retrySlot
+    def info = state.retryInfo
+    state.remove("retrySlot")
+    state.remove("retryInfo")
+    if (!slot || !info) return
+    if (logEnable) log.debug "${device.displayName}: retrySetCodeAfterClear — slot ${slot}, name ${info.name}"
+    // pendingCodes was already re-populated in handleSetPinResponse; just re-send the command.
+    // We don't have the raw PIN here, so fire a codeChanged "pending" event and let
+    // Lock Code Manager re-issue setCode() naturally on its next retry cycle.
+    // Remove from pendingCodes so we don't block further retries.
+    def pending = state.pendingCodes ?: [:]
+    pending.remove(slot)
+    state.pendingCodes = pending
+    sendEvent(name: "codeChanged", value: "${slot} failed",
+              descriptionText: "${device.displayName} slot ${slot} cleared of duplicate — Lock Code Manager will retry")
+    log.info "${device.displayName}: slot ${slot} cleared of pre-existing PIN — Lock Code Manager will re-issue setCode automatically"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

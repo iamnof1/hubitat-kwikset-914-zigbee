@@ -96,6 +96,10 @@ Other 914 firmware versions that report battery via `0x0020` should also work. T
 
 ## Changelog
 
+### 2026-02-21 (v2)
+- **Fix:** Catchall frames (command responses) were silently dropped with "unhandled cluster null" because `zigbee.parseDescriptionAsMap()` populates `.clusterId` (not `.cluster`) for those frame types. The `parse()` entry point now normalises both fields before routing, so Set PIN / Clear PIN responses are correctly handled.
+- **Fix:** When a PIN slot already contains a code (e.g. left over from a previous pairing or the built-in Generic driver), the lock returns status `0x03 Duplicate` to a Set PIN command. The driver now automatically clears the occupied slot and signals Lock Code Manager to retry, so codes always land successfully on the first Lock Code Manager retry cycle rather than looping indefinitely.
+
 ### 2026-02-21
 - **Fix:** `deleteCode()` now fires `codeChanged: "X deleted"` immediately on the hub's Clear PIN Code response, rather than waiting for a Programming Event Notification from the lock. Some firmware versions do not send Programming Events for hub-initiated deletes, which previously left Lock Code Manager with stale state. If a Programming Event does follow, it is handled harmlessly (idempotent remove).
 - **Fix:** Lock events triggered by a keypad code now include `data: [usedCode: <slot>, codeName: "<name>"]` so that Lock Code Manager can attribute lock/unlock events to the named user who entered the code. Events from physical operation (thumb turn, key) carry an empty data map.
